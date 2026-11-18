@@ -7,6 +7,7 @@ import hmac
 import io
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -17,6 +18,7 @@ from pathlib import Path
 
 import chromadb
 import numpy as np
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import streamlit as st
 from docx import Document
 from docx.oxml.table import CT_Tbl
@@ -50,7 +52,8 @@ ENV_LINE = secret("LINE_CHANNEL_ACCESS_TOKEN")
 ADMIN_PASSWORD = secret("ADMIN_PASSWORD")           # 未設定則整個 LINE 投放區塊隱藏
 MAX_UPLOAD_MB = int(secret("MAX_UPLOAD_MB", "20"))
 DOC_TTL = int(secret("DOC_TTL_MIN", "60")) * 60     # 文件索引閒置多久後釋放（秒）
-LINE_LIMIT, LINE_HOST = 500, "https://api.line.me"
+LINE_LIMIT = int(secret("LINE_LIMIT", "300"))       # LINE 投放字數上限（可在 Secrets 調整）
+LINE_HOST = "https://api.line.me"
 EXAMPLES = ("這份文件的重點是什麼？", "文件提到哪些規定或限制？", "有哪些風險或注意事項？")
 
 STRATEGIES = {
@@ -116,6 +119,35 @@ class LLM:
             if raise_err:
                 raise
             return None
+
+
+class KeyVault:
+    """以 AES-256-GCM 加密保存使用者輸入的 API Key。
+    加密金鑰為每個工作階段隨機產生，只存在記憶體中，不寫入磁碟；
+    每次加密使用新的隨機 nonce，並以 AAD 綁定用途，防止密文被挪作他用。"""
+
+    _AAD = b"groq-api-key/v1"
+
+    def __init__(self):
+        self._aes = AESGCM(AESGCM.generate_key(bit_length=256))
+        self._blob: bytes | None = None
+
+    def put(self, plain: str) -> None:
+        nonce = secrets.token_bytes(12)
+        self._blob = nonce + self._aes.encrypt(nonce, plain.encode("utf-8"), self._AAD)
+
+    def get(self) -> str:
+        if not self._blob:
+            return ""
+        nonce, ct = self._blob[:12], self._blob[12:]
+        return self._aes.decrypt(nonce, ct, self._AAD).decode("utf-8")
+
+    def clear(self) -> None:
+        self._blob = None
+
+    @property
+    def has_key(self) -> bool:
+        return self._blob is not None
 
 
 def list_models(key):
@@ -401,9 +433,7 @@ def line_text(q, ans, limit=LINE_LIMIT):
     q = " ".join(q.split())
     msg = f"❓ {q[:59] + '…' if len(q) > 60 else q}\n\n{body}"
     if len(msg) > limit:
-        cut = msg[:limit - 1]
-        end = max(cut.rfind(c) for c in "\n。！？；")
-        msg = (cut[:end + 1] if end > limit * 0.6 else cut).rstrip() + "…"
+        msg = msg[:limit - 1].rstrip() + "…"   # 直接截到 limit 字（含「…」），不因句尾而縮短
     return msg
 
 
@@ -456,6 +486,37 @@ for _k, _v in {"doc": None, "doc_tag": None, "doc_msg": "", "doc_error": "", "me
                "records": [], "last_qa": None, "model_options": MODELS, "is_admin": False,
                "pending": None}.items():
     ss.setdefault(_k, _v)
+if "key_vault" not in ss:
+    ss.key_vault = KeyVault()
+ss.setdefault("key_error", "")
+if "line_vault" not in ss:
+    ss.line_vault = KeyVault()
+ss.setdefault("line_error", "")
+
+
+def _store_line():
+    """LINE Token 送出時：加密保存並清空輸入框。"""
+    raw = (ss.get("line_input") or "").strip()
+    if raw:
+        if len(raw) >= 40:
+            ss.line_vault.put(raw)
+            ss.line_error = ""
+        else:
+            ss.line_error = "Token 長度不符，請確認是否完整複製"
+    ss.line_input = ""
+
+
+def _store_key():
+    """輸入框送出時：加密保存並立即清空輸入框，明文不留在 session 狀態中。"""
+    raw = (ss.get("key_input") or "").strip()
+    if raw:
+        if raw.startswith("gsk_") and len(raw) >= 20:
+            ss.key_vault.put(raw)
+            ss.key_error = ""
+        else:
+            ss.key_error = "金鑰格式不符（Groq 金鑰應以 gsk_ 開頭）"
+    ss.key_input = ""
+
 
 # ── 側欄 ──
 with st.sidebar:
@@ -464,9 +525,20 @@ with st.sidebar:
 
     # API Key：只存在使用者自己的 session，不寫入伺服器
     st.subheader("🔑 Groq API Key")
-    user_key = st.text_input("API Key", type="password", placeholder="gsk_…（留空則使用伺服器預設）",
-                             help="只保存在你的工作階段中，不寫入伺服器檔案或日誌。")
-    key = user_key.strip() or ENV_KEY
+    vault: KeyVault = ss.key_vault
+    if vault.has_key:
+        st.success("✓ 金鑰已以 AES-256-GCM 加密保存於此工作階段")
+        if st.button("清除金鑰"):
+            vault.clear()
+            st.rerun()
+    else:
+        st.caption("未輸入則使用伺服器預設金鑰")
+    st.text_input("輸入 API Key（Enter 送出後加密並清空）", type="password", key="key_input",
+                  placeholder="gsk_…", on_change=_store_key,
+                  help="金鑰只保存在你的工作階段記憶體中，不寫入伺服器檔案或日誌。")
+    if ss.key_error:
+        st.error(ss.key_error)
+    key = vault.get() or ENV_KEY
     if st.button("驗證並取得模型列表"):
         if not key:
             st.warning("尚未設定 Key")
@@ -516,24 +588,50 @@ with st.sidebar:
     st.caption(STRATEGIES[strategy][1])
     k = st.slider("片段數量 Top-K", 1, 10, 4)
 
-    # 管理員：LINE 投放（僅在設定 ADMIN_PASSWORD 時顯示）
-    line_tok, auto_line = "", False
-    if ADMIN_PASSWORD:
-        with st.expander("💬 管理員 · LINE Bot 投放"):
+    # LINE Bot：Token 一律可輸入（加密保存）；群發投放需管理員密碼
+    st.subheader("💬 LINE Bot")
+    line_vault: KeyVault = ss.line_vault
+    line_tok, auto_line = line_vault.get() or ENV_LINE, False
+    if line_vault.has_key:
+        st.success("✓ LINE Token 已加密保存於此工作階段")
+        if st.button("清除 LINE Token"):
+            line_vault.clear()
+            st.rerun()
+    elif ENV_LINE:
+        st.caption("已使用伺服器設定的 LINE Token")
+    else:
+        st.caption("尚未設定 LINE Token")
+    st.text_input("輸入 Channel Access Token（Enter 送出後加密並清空）", type="password", key="line_input",
+                  placeholder="Channel Access Token", on_change=_store_line,
+                  help="Token 只保存在你的工作階段記憶體中，不寫入伺服器檔案或日誌。")
+    if ss.line_error:
+        st.error(ss.line_error)
+    if st.button("驗證 LINE Token"):
+        if not line_tok:
+            st.warning("尚未設定 LINE Token")
+        else:
+            try:
+                st.success(f"✓ Token 有效 · {line_check(line_tok)}")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"✗ Token 驗證失敗：{line_err(e)}")
+
+    if not ADMIN_PASSWORD:
+        st.warning("未設定 ADMIN_PASSWORD，群發投放已停用（請在 Secrets 中設定）")
+    else:
+        with st.expander("🔐 管理員投放控制"):
             pw = st.text_input("管理員密碼", type="password", key="admin_pw")
             ss.is_admin = bool(pw) and hmac.compare_digest(pw.encode(), ADMIN_PASSWORD.encode())
             if pw and not ss.is_admin:
                 st.error("密碼錯誤")
             if ss.is_admin:
-                line_tok = st.text_input("Channel Access Token", type="password",
-                                         placeholder="留空則使用伺服器設定").strip() or ENV_LINE
-                if st.button("驗證 LINE Token"):
-                    try:
-                        st.success(f"✓ Token 有效 · {line_check(line_tok) if line_tok else '未設定'}")
-                    except Exception as e:  # noqa: BLE001
-                        st.error(f"✗ Token 驗證失敗：{line_err(e)}")
                 auto_line = st.checkbox(f"回答後自動投放（≤{LINE_LIMIT} 字）")
                 st.caption("⚠ 投放會群發給所有加入官方帳號的好友，並消耗每月訊息額度。")
+                if ss.last_qa:
+                    preview = line_text(*ss.last_qa)
+                    st.caption(f"投放預覽（{len(preview)}/{LINE_LIMIT} 字）")
+                    st.text(preview)
+                else:
+                    st.caption("尚無可投放的回答")
                 confirm = st.checkbox("我確認要群發")
                 if st.button("📤 投放最後一則回答", disabled=not (confirm and ss.last_qa and line_tok)):
                     st.toast(push_line(line_tok, *ss.last_qa))
